@@ -1,5 +1,5 @@
 // Offline support. Change VERSION whenever you upload new app files.
-const VERSION = 'my-money-v1';
+const VERSION = 'my-money-v2';
 const ASSETS = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest', './icon-180.png', './icon-512.png'];
 
 self.addEventListener('install', e => {

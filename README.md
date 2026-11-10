@@ -30,7 +30,10 @@ It works offline, doesn't expire, and doesn't need to be refreshed.
 - **More → Bills & recurring:** add rent, phone, insurance, subscriptions, and salary.
 - **More → Loans:** add bank loans and money you lent to or borrowed from friends.
 - **More → Budgets:** set monthly limits (optional).
-- Tap **＋** to add an expense or income in a few seconds.
+- **More → Settings → Categories:** add your own categories and subcategories at any depth
+  (e.g. Groceries › Edeka › Dairy). There are tabs for Expenses, Income and Transfers.
+- **More → Settings → Payment methods:** add Mastercard, Visa, PayPal, Apple Pay… and link each one to an account.
+- Tap **＋** to add an expense or income in a few seconds. While adding, the dashed **＋** chip creates a new subcategory on the spot.
 
 ## 4. Backups (important!)
 Go to **More → Backup & data → Back up now → Save to Files → iCloud Drive** every week or two.

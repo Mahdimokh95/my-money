@@ -107,13 +107,29 @@ async function persist() {
 /* ================= Data model ================= */
 let S; // the whole app state
 
+/* Adds a category with subcategories. A sub can be a name or [name, [sub-subs…]] for deeper levels. */
+function seedCat(cats, type, icon, name, subs = [], extra = {}, parent = null) {
+  const id = uid();
+  cats.push({ id, type, icon, name, parent, ...extra });
+  subs.forEach(s => Array.isArray(s) ? seedCat(cats, type, icon, s[0], s[1] || [], {}, id) : cats.push({ id: uid(), type, icon, name: s, parent: id }));
+}
+function seedTransferCats(cats) {
+  seedCat(cats, 'transfer', '🏧', 'Cash withdrawal');
+  seedCat(cats, 'transfer', '🐷', 'Savings');
+  seedCat(cats, 'transfer', '💳', 'Credit card payment');
+  seedCat(cats, 'transfer', '🔁', 'Between my accounts');
+}
+function defaultMethods(cashId, bankId) {
+  return [
+    { id: uid(), name: 'Cash', icon: '💶', accountId: cashId || null },
+    { id: uid(), name: 'Girocard (EC)', icon: '💳', accountId: bankId || null },
+    { id: uid(), name: 'Bank transfer / direct debit', icon: '🏦', accountId: bankId || null },
+    { id: uid(), name: 'PayPal', icon: '🅿️', accountId: bankId || null },
+  ];
+}
 function defaultState() {
   const cats = [];
-  const add = (type, icon, name, subs = [], extra = {}) => {
-    const id = uid();
-    cats.push({ id, type, icon, name, parent: null, ...extra });
-    subs.forEach(n => cats.push({ id: uid(), type, icon, name: n, parent: id }));
-  };
+  const add = (...a) => seedCat(cats, ...a);
   add('expense', '🛒', 'Groceries', ['Supermarket', 'Bakery', 'Drugstore']);
   add('expense', '🏠', 'Home', ['Rent', 'Nebenkosten', 'Electricity', 'Gas / Heating', 'Internet & Phone', 'Rundfunkbeitrag', 'Furniture & repairs']);
   add('expense', '🚗', 'Car', ['Fuel', 'Maintenance & repairs', 'Insurance', 'Kfz-Steuer', 'TÜV / HU', 'Tires', 'Parking & tolls', 'Car wash'], { odo: true });
@@ -134,29 +150,48 @@ function defaultState() {
   add('income', '📈', 'Interest & investments');
   add('income', '🎁', 'Gifts received');
   add('income', '➕', 'Other income');
+  seedTransferCats(cats);
+  const cashId = uid(), bankId = uid();
   return {
-    version: 1,
+    version: 2,
     settings: { lastBackup: null, created: today() },
     accounts: [
-      { id: uid(), name: 'Cash', type: 'cash', opening: 0 },
-      { id: uid(), name: 'Girokonto', type: 'bank', opening: 0 },
+      { id: cashId, name: 'Cash', type: 'cash', opening: 0 },
+      { id: bankId, name: 'Girokonto', type: 'bank', opening: 0 },
     ],
+    methods: defaultMethods(cashId, bankId),
     categories: cats, transactions: [], loans: [], recurring: [], budgets: {},
   };
 }
 function migrate() {
-  for (const k of ['accounts', 'categories', 'transactions', 'loans', 'recurring']) if (!Array.isArray(S[k])) S[k] = [];
+  for (const k of ['accounts', 'categories', 'transactions', 'loans', 'recurring', 'methods']) if (!Array.isArray(S[k])) S[k] = [];
   if (!S.budgets) S.budgets = {};
   if (!S.settings) S.settings = { lastBackup: null };
+  if ((S.version || 1) < 2) { // v2: transfer categories + payment methods
+    if (!S.categories.some(c => c.type === 'transfer')) seedTransferCats(S.categories);
+    if (!S.methods.length) S.methods = defaultMethods(S.accounts.find(a => a.type === 'cash' && !a.archived)?.id,
+      S.accounts.find(a => a.type === 'bank' && !a.archived)?.id);
+    S.version = 2;
+  }
 }
 
 const acc = id => S.accounts.find(a => a.id === id);
 const cat = id => S.categories.find(c => c.id === id);
 const loan = id => S.loans.find(l => l.id === id);
 const rec = id => S.recurring.find(r => r.id === id);
-const topCat = id => { const c = cat(id); return c && c.parent ? cat(c.parent) : c; };
-const catName = id => { const c = cat(id); if (!c) return 'Uncategorized'; const p = c.parent && cat(c.parent); return p ? `${p.name} › ${c.name}` : c.name; };
+const method = id => S.methods.find(m => m.id === id);
+const children = id => S.categories.filter(c => c.parent === id);
+/* [root, …, category] — categories can be nested to any depth */
+const catPath = id => { const out = []; let c = cat(id), g = 0; while (c && g++ < 30) { out.unshift(c); c = c.parent ? cat(c.parent) : null; } return out; };
+const topCat = id => catPath(id)[0];
+const catName = id => { const p = catPath(id); return p.length ? p.map(c => c.name).join(' › ') : 'Uncategorized'; };
 const catIcon = id => topCat(id)?.icon || '•';
+const descendants = id => { const out = []; const walk = p => S.categories.forEach(c => { if (c.parent === p) { out.push(c.id); walk(c.id); } }); walk(id); return out; };
+/* Depth-first list [{c, depth}] of all categories of a type */
+function catTree(type, parent = null, depth = 0, out = []) {
+  for (const c of S.categories) if (c.type === type && (c.parent || null) === parent) { out.push({ c, depth }); catTree(type, c.id, depth + 1, out); }
+  return out;
+}
 const activeAccounts = () => S.accounts.filter(a => !a.archived);
 const ACC_ICON = { cash: '💶', bank: '🏦', card: '💳', savings: '🐷' };
 
@@ -193,7 +228,27 @@ function monthStats(ym) {
   return { income, expense, net: income - expense, byCat, byInc };
 }
 const statLabel = (k, type) => k === 'interest' ? (type === 'expense' ? '🏦 Loan interest' : '🏦 Loan interest received')
-  : k === 'none' ? '• Uncategorized' : `${cat(k)?.icon || ''} ${cat(k)?.name || '?'}`;
+  : k === 'none' ? (type === 'transfer' ? '🔁 No category' : '• Uncategorized') : `${cat(k)?.icon || ''} ${cat(k)?.name || '?'}`;
+
+/* Sub-breakdown of one main category for a month, as indented rows (any depth) */
+function catBreakdown(ym, type, rootId) {
+  const total = {}, direct = {};
+  for (const t of S.transactions) {
+    if (t.type !== type || !t.categoryId || !t.date.startsWith(ym)) continue;
+    const p = catPath(t.categoryId);
+    if (p[0]?.id !== rootId) continue;
+    direct[t.categoryId] = (direct[t.categoryId] || 0) + t.amount;
+    p.forEach(c => { total[c.id] = (total[c.id] || 0) + t.amount; });
+  }
+  const rows = (id, depth) => {
+    const kids = children(id).filter(c => total[c.id]).sort((a, b) => total[b.id] - total[a.id]);
+    if (!kids.length) return '';
+    const pad = `style="padding-left:${depth * 16}px"`;
+    return kids.map(c => `<div class="row between" ${pad}><span>${depth ? '└ ' : ''}${esc(c.name)}</span><span>${fm(total[c.id])}</span></div>${rows(c.id, depth + 1)}`).join('')
+      + (direct[id] ? `<div class="row between" ${pad}><span>${depth ? '└ ' : ''}(general)</span><span>${fm(direct[id])}</span></div>` : '');
+  };
+  return rows(rootId, 0);
+}
 
 /* Loans */
 const loanFlow = l => l.direction === 'borrowed' ? 'out' : 'in'; // direction of repayments
@@ -226,7 +281,7 @@ function processRecurring() {
     let guard = 0;
     while (r.nextDate <= td && guard++ < 200) {
       S.transactions.push({ id: uid(), type: r.type, amount: r.amount, date: r.nextDate, accountId: r.accountId,
-        categoryId: r.categoryId, note: r.name, recurringId: r.id, created: Date.now() });
+        categoryId: r.categoryId, note: r.name, recurringId: r.id, created: Date.now(), ...(r.methodId ? { methodId: r.methodId } : {}) });
       r.nextDate = nextOcc(r);
       added++;
     }
@@ -264,7 +319,7 @@ const barCls = pct => pct >= 100 ? 'over' : pct >= 80 ? 'warn' : '';
 
 /* ================= Rendering ================= */
 let view = 'home', viewArg = null;
-const PARENT = { loans: 'more', loan: 'loans', recurring: 'more', budgets: 'more', accounts: 'more', categories: 'more', backup: 'more' };
+const PARENT = { loans: 'more', loan: 'loans', recurring: 'more', budgets: 'more', accounts: 'more', categories: 'more', methods: 'more', backup: 'more' };
 const TAB = v => PARENT[v] ? 'more' : v;
 
 function go(v, arg = null) { view = v; viewArg = arg; render(); window.scrollTo(0, 0); }
@@ -284,7 +339,9 @@ function txRow(t, showDate = false) {
   const a = acc(t.accountId);
   let icon, title, sub, cls = '', sign = '';
   if (t.type === 'transfer') {
-    icon = '🔁'; title = t.note || 'Transfer'; sub = `${a?.name || '?'} → ${acc(t.toAccountId)?.name || '?'}`;
+    const cn = cat(t.categoryId) ? catName(t.categoryId) : '';
+    icon = cn ? catIcon(t.categoryId) : '🔁'; title = t.note || cn || 'Transfer';
+    sub = (t.note && cn ? cn + ' · ' : '') + `${a?.name || '?'} → ${acc(t.toAccountId)?.name || '?'}`;
   } else if (t.type === 'loan') {
     const l = loan(t.loanId);
     icon = '🤝'; title = loanTxTitle(t, l); sub = (t.note ? t.note + ' · ' : '') + (a?.name || '');
@@ -292,7 +349,8 @@ function txRow(t, showDate = false) {
     cls = t.flow === 'in' ? 'pos' : ''; sign = t.flow === 'in' ? '+' : '−';
   } else {
     icon = catIcon(t.categoryId); title = t.note || catName(t.categoryId);
-    sub = (t.note ? catName(t.categoryId) + ' · ' : '') + (a?.name || '');
+    const m = method(t.methodId);
+    sub = [t.note ? catName(t.categoryId) : '', m?.name, a && a.name !== m?.name ? a.name : ''].filter(Boolean).join(' · ');
     if (t.odometer) sub += ` · ${t.odometer.toLocaleString('de-DE')} km`;
     cls = t.type === 'income' ? 'pos' : ''; sign = t.type === 'income' ? '+' : '−';
   }
@@ -393,23 +451,39 @@ const VIEWS = {
 
     h += `<div class="card"><h2>Spending by category</h2>${exp.length ? exp.map(([k, v]) => {
       const pct = st.expense ? Math.round(v / st.expense * 100) : 0;
-      const open = expanded.has(k);
-      let subs = '';
-      if (open && k !== 'interest' && k !== 'none') {
-        const bySub = {};
-        for (const t of S.transactions) if (t.type === 'expense' && t.date.startsWith(ym) && topCat(t.categoryId)?.id === k) bySub[t.categoryId] = (bySub[t.categoryId] || 0) + t.amount;
-        subs = `<div class="subrows">${Object.entries(bySub).sort((a, b) => b[1] - a[1]).map(([id, a]) =>
-          `<div class="row between"><span>${esc(cat(id)?.parent ? cat(id).name : '(general)')}</span><span>${fm(a)}</span></div>`).join('')}</div>`;
-      }
+      const sub = k !== 'interest' && k !== 'none' && expanded.has(k) ? catBreakdown(ym, 'expense', k) : '';
+      const subs = sub ? `<div class="subrows">${sub}</div>` : '';
       const budget = S.budgets[k];
-      return `<div style="margin:10px 0" data-act="toggleCat" data-id="${k}" class="tap"><div class="row between"><span>${esc(statLabel(k, 'expense'))} <span class="t2">${pct}%</span></span>
+      return `<div style="margin:10px 0" data-act="toggleCat" data-id="${k}" class="tap"><div class="row between"><span>${esc(statLabel(k, 'expense'))} <span class="t2">${pct}%${children(k).length ? (expanded.has(k) ? ' ▾' : ' ▸') : ''}</span></span>
         <b>${fm(v)}</b></div><div class="bar"><i style="width:${pct}%"></i></div>
         ${budget ? `<div class="t2">Budget ${fm(budget)} · ${v > budget ? `<span class="neg">${fm(v - budget)} over</span>` : `${fm(budget - v)} left`}</div>` : ''}${subs}</div>`;
     }).join('') : '<div class="t2">No expenses this month.</div>'}</div>`;
 
-    h += `<div class="card"><h2>Income by source</h2>${inc.length ? inc.map(([k, v]) =>
-      `<div class="row between" style="margin:8px 0"><span>${esc(statLabel(k, 'income'))}</span><b class="pos">${fm(v)}</b></div>`).join('')
-      : '<div class="t2">No income this month.</div>'}</div>`;
+    const smallRows = (entries, type, cls) => entries.map(([k, v]) => {
+      const sub = k !== 'interest' && k !== 'none' && expanded.has(k) ? catBreakdown(ym, type, k) : '';
+      return `<div class="tap" data-act="toggleCat" data-id="${k}" style="margin:8px 0"><div class="row between"><span>${esc(statLabel(k, type))}
+        <span class="t2">${children(k).length ? (expanded.has(k) ? '▾' : '▸') : ''}</span></span><b class="${cls}">${fm(v)}</b></div>${sub ? `<div class="subrows">${sub}</div>` : ''}</div>`;
+    }).join('');
+    h += `<div class="card"><h2>Income by source</h2>${inc.length ? smallRows(inc, 'income', 'pos') : '<div class="t2">No income this month.</div>'}</div>`;
+
+    // Spending by payment method (only once methods are being used)
+    const byM = {};
+    for (const t of S.transactions) if (t.type === 'expense' && t.date.startsWith(ym)) { const k = method(t.methodId) ? t.methodId : 'none'; byM[k] = (byM[k] || 0) + t.amount; }
+    const mEntries = Object.entries(byM).sort((a, b) => b[1] - a[1]), mTotal = mEntries.reduce((s, e) => s + e[1], 0);
+    if (mEntries.some(([k]) => k !== 'none')) {
+      h += `<div class="card"><h2>Spending by payment method</h2>${mEntries.map(([k, v]) => {
+        const m = method(k), pct = mTotal ? Math.round(v / mTotal * 100) : 0;
+        return `<div style="margin:10px 0"><div class="row between"><span>${m ? `${m.icon} ${esc(m.name)}` : '• Not set'} <span class="t2">${pct}%</span></span><b>${fm(v)}</b></div>
+          <div class="bar"><i style="width:${pct}%"></i></div></div>`;
+      }).join('')}</div>`;
+    }
+
+    // Transfers (not counted as income or spending)
+    const byT = {};
+    for (const t of S.transactions) if (t.type === 'transfer' && t.date.startsWith(ym)) { const k = topCat(t.categoryId)?.id || 'none'; byT[k] = (byT[k] || 0) + t.amount; }
+    const tEntries = Object.entries(byT).sort((a, b) => b[1] - a[1]);
+    if (tEntries.length) h += `<div class="card"><h2>Transfers</h2>${smallRows(tEntries, 'transfer', '')}
+      <div class="hint">Moving money between your own accounts — not counted as income or spending.</div></div>`;
 
     h += `<div class="card"><h2>Last 6 months</h2><div class="trend">${ms.map(x => `<div class="col ${x.m === ym ? 'cur' : ''}" data-act="go" data-v="reports" data-id="${x.m}">
         <div class="bars"><i class="in" style="height:${x.income / max * 100}%"></i><i class="out" style="height:${x.expense / max * 100}%"></i></div>
@@ -426,14 +500,18 @@ const VIEWS = {
       ['loans', '🤝', 'Loans & debts', openLoans ? `${openLoans} open` : 'Money you owe or lent'],
       ['recurring', '🔁', 'Bills & recurring', `${S.recurring.filter(r => r.active).length} active`],
       ['budgets', '🎯', 'Budgets', 'Monthly limits per category'],
+    ];
+    const settings = [
+      ['categories', '🏷️', 'Categories', 'Expenses, income & transfers, with subcategories'],
+      ['methods', '💳', 'Payment methods', S.methods.filter(m => !m.archived).map(m => m.name).join(', ') || 'Mastercard, PayPal, cash…'],
       ['accounts', '🏦', 'Accounts', 'Cash, bank, cards'],
-      ['categories', '🏷️', 'Categories', 'Edit or add categories'],
       ['backup', '💾', 'Backup & data', S.settings.lastBackup ? `Last backup ${fmtDate(S.settings.lastBackup)}` : 'No backup yet'],
     ];
+    const menu = list => `<div class="card list menu">${list.map(([v, i, t, s]) => `<div class="item" data-act="go" data-v="${v}"><div class="ic">${i}</div>
+        <div class="grow"><div class="t1">${t}</div><div class="t2">${esc(s)}</div></div><span class="chev">›</span></div>`).join('')}</div>`;
     return {
       title: 'More',
-      html: `<div class="card list menu">${items.map(([v, i, t, s]) => `<div class="item" data-act="go" data-v="${v}"><div class="ic">${i}</div>
-        <div class="grow"><div class="t1">${t}</div><div class="t2">${esc(s)}</div></div><span class="chev">›</span></div>`).join('')}</div>
+      html: `${menu(items)}<div class="day"><span>Settings</span></div>${menu(settings)}
         <p class="hint" style="text-align:center">All data is stored only on this iPhone.<br>Back up regularly.</p>`,
     };
   },
@@ -534,17 +612,33 @@ const VIEWS = {
 
   categories() {
     const tops = S.categories.filter(c => c.type === catTab && !c.parent);
+    const tabs = [['expense', 'Expenses'], ['income', 'Income'], ['transfer', 'Transfers']];
     return {
       title: 'Categories', action: { label: '+ New', act: 'newCat' },
-      html: `<div class="seg"><button class="${catTab === 'expense' ? 'on' : ''}" data-act="catTab" data-type="expense">Expenses</button>
-        <button class="${catTab === 'income' ? 'on' : ''}" data-act="catTab" data-type="income">Income</button></div>
-        ${tops.map(c => {
-          const subs = S.categories.filter(s => s.parent === c.id);
-          return `<div class="card list"><div class="item" data-act="editCat" data-id="${c.id}"><div class="ic">${c.icon}</div>
+      html: `<div class="seg">${tabs.map(([v, l]) => `<button class="${catTab === v ? 'on' : ''}" data-act="catTab" data-type="${v}">${l}</button>`).join('')}</div>
+        <p class="hint">Tap a name to rename, move or delete it. Tap <b>＋</b> to add a subcategory inside it, e.g. Groceries › Edeka › Dairy.
+          <b>+ New</b> at the top adds a main category.</p>
+        ${tops.length ? '' : '<div class="empty">No categories yet. Tap <b>+ New</b>.</div>'}
+        ${tops.map(c => `<div class="card list"><div class="item" data-act="editCat" data-id="${c.id}"><div class="ic">${c.icon}</div>
             <div class="grow"><div class="t1">${esc(c.name)}</div>${c.odo ? '<div class="t2">asks for odometer</div>' : ''}</div><span class="chev t2">Edit</span></div>
-            ${subs.map(s => `<div class="item" data-act="editCat" data-id="${s.id}" style="padding-left:50px"><div class="grow">${esc(s.name)}</div></div>`).join('')}
-            <div class="item" data-act="newCat" data-parent="${c.id}" style="padding-left:50px"><span class="link" style="padding:0">+ Add subcategory</span></div></div>`;
-        }).join('')}`,
+            ${catTree(catTab, c.id, 1).map(({ c: s, depth }) => `<div class="item" data-act="editCat" data-id="${s.id}" style="padding-left:${50 + (depth - 1) * 22}px">
+              <div class="grow t1" style="font-weight:400">${depth > 1 ? '<span class="t2">└ </span>' : ''}${esc(s.name)}</div>
+              <button class="link addsub" data-act="newCat" data-parent="${s.id}" aria-label="Add subcategory in ${esc(s.name)}">＋</button></div>`).join('')}
+            <div class="item" data-act="newCat" data-parent="${c.id}" style="padding-left:50px"><span class="link" style="padding:0">+ Add subcategory</span></div></div>`).join('')}`,
+    };
+  },
+
+  methods() {
+    const row = m => `<div class="item ${m.archived ? 'dim' : ''}" data-act="editMethod" data-id="${m.id}"><div class="ic">${esc(m.icon)}</div>
+      <div class="grow"><div class="t1">${esc(m.name)}</div><div class="t2">${acc(m.accountId) ? 'Linked to ' + esc(acc(m.accountId).name) : 'No linked account'}${m.archived ? ' · archived' : ''}</div></div>
+      <span class="chev t2">Edit</span></div>`;
+    return {
+      title: 'Payment methods', action: { label: '+ New', act: 'newMethod' },
+      html: `<p class="hint">How you pay or get paid: cash, Girocard, Mastercard, PayPal, Apple Pay… You pick one when adding an entry.
+          Link it to an account, and that account is chosen for you.</p>
+        ${S.methods.length ? `<div class="card list">${S.methods.map(row).join('')}</div>` : '<div class="empty">No payment methods yet. Tap <b>+ New</b>.</div>'}
+        <p class="hint">Tip: if your credit card has its own bill, add it under <b>Accounts</b> as a “Credit card” too and link this method to it.
+          Then pay the bill with a <b>Transfer</b> from your Girokonto.</p>`,
     };
   },
 
@@ -574,7 +668,7 @@ const VIEWS = {
 
 /* History list (re-rendered on filter change without losing input focus) */
 const hist = { q: '', month: 'all', type: 'all' };
-const txSearchText = t => [t.note, t.type === 'loan' ? loanTxTitle(t, loan(t.loanId)) : catName(t.categoryId), acc(t.accountId)?.name,
+const txSearchText = t => [t.note, t.type === 'loan' ? loanTxTitle(t, loan(t.loanId)) : catName(t.categoryId), acc(t.accountId)?.name, method(t.methodId)?.name,
   acc(t.toAccountId)?.name, centsToInput(t.amount), fm(t.amount), fmtDate(t.date)].join(' ').toLowerCase();
 function histList() {
   const q = hist.q.trim().toLowerCase();
@@ -633,15 +727,50 @@ function recentCats(type) {
   }
   return out;
 }
+/* Category chips: main categories, then one row of subcategories per selected level (any depth) */
 function catPicker(type, selId, showRecent) {
   const tops = S.categories.filter(c => c.type === type && !c.parent);
-  const selTop = selId ? topCat(selId) : null;
-  const subs = selTop ? S.categories.filter(c => c.parent === selTop.id) : [];
+  const path = selId ? catPath(selId) : [], onPath = new Set(path.map(c => c.id));
   const recent = showRecent ? recentCats(type).filter(id => id !== selId) : [];
-  return `${recent.length ? `<div class="mini">Recent</div><div class="chips">${recent.map(id =>
+  let h = `${recent.length ? `<div class="mini">Recent</div><div class="chips">${recent.map(id =>
       `<button class="chip" data-act="pickCat" data-id="${id}">${catIcon(id)} ${esc(catName(id))}</button>`).join('')}</div><div class="mini">All</div>` : ''}
-    <div class="chips">${tops.map(c => `<button class="chip ${selTop?.id === c.id ? 'on' : ''}" data-act="pickCat" data-id="${c.id}">${c.icon} ${esc(c.name)}</button>`).join('')}</div>
-    ${subs.length ? `<div class="chips sub">${subs.map(c => `<button class="chip ${selId === c.id ? 'on' : ''}" data-act="pickCat" data-id="${c.id}">${esc(c.name)}</button>`).join('')}</div>` : ''}`;
+    <div class="chips">${tops.map(c => `<button class="chip ${onPath.has(c.id) ? 'on' : ''}" data-act="pickCat" data-id="${c.id}">${c.icon} ${esc(c.name)}</button>`).join('')}</div>`;
+  for (const node of path) {
+    const kids = children(node.id);
+    h += `<div class="chips sub">${kids.length ? '' : `<span class="mini" style="margin:0 4px">${esc(node.name)} ›</span>`}${kids.map(c =>
+      `<button class="chip ${onPath.has(c.id) ? 'on' : ''}" data-act="pickCat" data-id="${c.id}">${esc(c.name)}</button>`).join('')}
+      <button class="chip add" data-act="quickCat" data-parent="${node.id}" aria-label="New subcategory in ${esc(node.name)}">＋${kids.length ? '' : ' subcategory'}</button></div>`;
+  }
+  return h;
+}
+/* Quick-add a subcategory from inside a form; returns the new id */
+function quickAddCat(parentId) {
+  const p = cat(parentId);
+  if (!p) return null;
+  const name = (prompt(`New subcategory in “${catName(p.id)}”:`) || '').trim();
+  if (!name) return null;
+  const c = { id: uid(), type: p.type, parent: p.id, icon: p.icon, name };
+  S.categories.push(c); persist(); toast(`Added ${name}`);
+  return c.id;
+}
+function methodPicker(selId) {
+  const ms = S.methods.filter(m => !m.archived || m.id === selId);
+  return `<div class="chips">${ms.map(m => `<button class="chip ${selId === m.id ? 'on' : ''}" data-act="pickMethod" data-id="${m.id}">${esc(m.icon)} ${esc(m.name)}</button>`).join('')}
+    <button class="chip add" data-act="manageMethods">＋ Add</button></div>`;
+}
+/* Choosing a payment method also chooses its linked account */
+function applyMethod(f, id) {
+  f.methodId = f.methodId === id ? null : id;
+  const a = acc(method(f.methodId)?.accountId);
+  if (a && !a.archived) f.accountId = a.id;
+}
+const lastMethodId = () => sortedTx().find(t => method(t.methodId) && !method(t.methodId).archived)?.methodId || null;
+/* Common sheet actions for forms that have category + method pickers */
+function pickerActions(sh, f, sync, draw) {
+  sh.actions.pickCat = el => { sync(); f.categoryId = f.type === 'transfer' && f.categoryId === el.dataset.id ? null : el.dataset.id; draw(); };
+  sh.actions.quickCat = el => { sync(); const id = quickAddCat(el.dataset.parent); if (id) { f.categoryId = id; draw(); } };
+  sh.actions.pickMethod = el => { sync(); applyMethod(f, el.dataset.id); draw(); };
+  sh.actions.manageMethods = () => { if (confirm('Close this form and go to Settings › Payment methods?')) { closeSheet(); go('methods'); } };
 }
 function afterSave(msg = 'Saved') { persist(); closeSheet(); render(); toast(msg); }
 
@@ -651,7 +780,8 @@ function openTxForm(t, pre = {}) {
   openSheet(sh => {
     const isEdit = !!t;
     const f = t ? { ...t, _amt: centsToInput(t.amount) }
-      : { type: 'expense', _amt: '', date: today(), accountId: lastAccountId(), categoryId: null, note: '', ...pre };
+      : { type: 'expense', _amt: '', date: today(), accountId: lastAccountId(), categoryId: null, note: '', methodId: null, ...pre };
+    if (!t && !('methodId' in pre)) { const m = lastMethodId(); if (m) applyMethod(f, m); }
     if (!f.toAccountId) f.toAccountId = activeAccounts().find(a => a.id !== f.accountId)?.id || '';
     const sync = () => {
       f._amt = val('fAmount'); f.accountId = val('fAcc'); f.date = val('fDate') || today(); f.note = val('fNote').trim();
@@ -664,10 +794,11 @@ function openTxForm(t, pre = {}) {
         <div class="seg">${[['expense', 'Expense', 'exp'], ['income', 'Income', 'inc'], ['transfer', 'Transfer', '']].map(([v, l, c]) =>
           `<button class="${f.type === v ? 'on ' + c : ''}" data-act="setType" data-type="${v}">${l}</button>`).join('')}</div>
         <input id="fAmount" class="amount" inputmode="decimal" placeholder="0,00 €" value="${esc(f._amt)}" autocomplete="off">
-        ${isT ? '' : `<label class="f">Category</label>${catPicker(f.type, f.categoryId, true)}`}
+        <label class="f">Category${isT ? ' (optional)' : ''}</label>${catPicker(f.type, f.categoryId, true)}
         ${isT ? `<div class="two"><div><label class="f">From</label><select id="fAcc">${accountOptions(f.accountId)}</select></div>
                  <div><label class="f">To</label><select id="fTo">${accountOptions(f.toAccountId)}</select></div></div>`
-              : `<label class="f">Account</label><select id="fAcc">${accountOptions(f.accountId)}</select>`}
+              : `<label class="f">${f.type === 'income' ? 'Received via' : 'Paid with'}</label>${methodPicker(f.methodId)}
+                 <label class="f">Account</label><select id="fAcc">${accountOptions(f.accountId)}</select>`}
         <div class="${odo ? 'two' : ''}"><div><label class="f">Date</label><input id="fDate" type="date" value="${f.date}"></div>
         ${odo ? `<div><label class="f">Odometer (km)</label><input id="fOdo" inputmode="numeric" placeholder="optional" value="${f.odometer || ''}"></div>` : ''}</div>
         <label class="f">Note</label><input id="fNote" placeholder="${isT ? 'e.g. Cash withdrawal' : 'e.g. Rewe, Aral, Dr. Müller…'}" value="${esc(f.note)}" autocomplete="off">
@@ -675,7 +806,7 @@ function openTxForm(t, pre = {}) {
         ${isEdit ? '<button class="btn danger" data-act="del">Delete</button>' : ''}`;
     };
     sh.actions.setType = el => { sync(); if (f.type !== el.dataset.type) { f.type = el.dataset.type; f.categoryId = null; } draw(); };
-    sh.actions.pickCat = el => { sync(); f.categoryId = el.dataset.id; draw(); };
+    pickerActions(sh, f, sync, draw);
     sh.actions.save = () => {
       sync();
       const amount = parseAmount(f._amt);
@@ -684,10 +815,12 @@ function openTxForm(t, pre = {}) {
       if (!f.accountId) return toast('Please add an account first');
       if (f.type === 'transfer' && f.accountId === f.toAccountId) return toast('Choose two different accounts');
       const data = { type: f.type, amount, date: f.date, accountId: f.accountId, note: f.note };
-      if (f.type === 'transfer') data.toAccountId = f.toAccountId; else data.categoryId = f.categoryId;
+      if (f.categoryId && cat(f.categoryId)) data.categoryId = f.categoryId;
+      if (f.type === 'transfer') data.toAccountId = f.toAccountId;
+      else if (method(f.methodId)) data.methodId = f.methodId;
       if (f.type !== 'transfer' && topCat(f.categoryId)?.odo && f.odometer) data.odometer = f.odometer;
       if (isEdit) {
-        delete t.toAccountId; delete t.categoryId; delete t.odometer;
+        delete t.toAccountId; delete t.categoryId; delete t.odometer; delete t.methodId;
         Object.assign(t, data);
       } else {
         S.transactions.push({ id: uid(), created: Date.now(), ...data, ...(f.recurringId ? { recurringId: f.recurringId } : {}) });
@@ -814,7 +947,7 @@ function openRecurringForm(r) {
   openSheet(sh => {
     const isEdit = !!r;
     const f = r ? { ...r, _amt: centsToInput(r.amount) }
-      : { name: '', type: 'expense', _amt: '', categoryId: null, accountId: lastAccountId(), freq: 'monthly', nextDate: today(), autoAdd: false, active: true };
+      : { name: '', type: 'expense', _amt: '', categoryId: null, methodId: null, accountId: lastAccountId(), freq: 'monthly', nextDate: today(), autoAdd: false, active: true };
     const sync = () => {
       f.name = val('rName').trim(); f._amt = val('rAmt'); f.accountId = val('rAcc'); f.freq = val('rFreq');
       f.nextDate = val('rDate') || today(); f.autoAdd = checked('rAuto');
@@ -827,6 +960,7 @@ function openRecurringForm(r) {
         <label class="f">Name</label><input id="rName" value="${esc(f.name)}" placeholder="${f.type === 'expense' ? 'e.g. Rent, Vodafone, Netflix' : 'e.g. Salary'}" autocomplete="off">
         <label class="f">Amount</label><input id="rAmt" class="amount" style="margin-top:0" inputmode="decimal" placeholder="0,00 €" value="${esc(f._amt)}">
         <label class="f">Category</label>${catPicker(f.type, f.categoryId, false)}
+        <label class="f">${f.type === 'income' ? 'Received via' : 'Paid with'} (optional)</label>${methodPicker(f.methodId)}
         <label class="f">Account</label><select id="rAcc">${accountOptions(f.accountId)}</select>
         <div class="two"><div><label class="f">How often</label><select id="rFreq">${Object.entries(FREQ).map(([k, v]) => `<option value="${k}" ${f.freq === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
           <div><label class="f">Next due date</label><input id="rDate" type="date" value="${f.nextDate}"></div></div>
@@ -837,7 +971,7 @@ function openRecurringForm(r) {
         ${isEdit ? '<button class="btn danger" data-act="del">Delete</button>' : ''}`;
     };
     sh.actions.setType = el => { sync(); if (f.type !== el.dataset.type) { f.type = el.dataset.type; f.categoryId = null; } draw(); };
-    sh.actions.pickCat = el => { sync(); f.categoryId = el.dataset.id; draw(); };
+    pickerActions(sh, f, sync, draw);
     sh.actions.save = () => {
       sync();
       const amount = parseAmount(f._amt);
@@ -845,7 +979,7 @@ function openRecurringForm(r) {
       if (!(amount > 0)) return toast('Please enter an amount');
       if (!f.categoryId) return toast('Please choose a category');
       const data = { name: f.name, type: f.type, amount, categoryId: f.categoryId, accountId: f.accountId, freq: f.freq,
-        nextDate: f.nextDate, day: parseISO(f.nextDate).getDate(), autoAdd: f.autoAdd, active: f.active };
+        nextDate: f.nextDate, day: parseISO(f.nextDate).getDate(), autoAdd: f.autoAdd, active: f.active, methodId: method(f.methodId) ? f.methodId : null };
       if (isEdit) Object.assign(r, data); else S.recurring.push({ id: uid(), ...data });
       const n = processRecurring();
       afterSave(n ? `Saved · ${n} past entr${n > 1 ? 'ies' : 'y'} added` : 'Saved ✓');
@@ -887,6 +1021,7 @@ function openAccountForm(a) {
       if (used) return alert('This account has transactions or recurring items. Archive it instead, so your history stays correct.');
       if (!confirm('Delete this account?')) return;
       S.accounts = S.accounts.filter(x => x.id !== a.id);
+      S.methods.forEach(m => { if (m.accountId === a.id) m.accountId = null; });
       afterSave('Deleted');
     };
   });
@@ -896,31 +1031,80 @@ function openAccountForm(a) {
 function openCategoryForm(c, parentId) {
   openSheet(sh => {
     const isEdit = !!c;
-    const parent = cat(isEdit ? c.parent : parentId);
-    const isTop = !parent;
-    const type = isEdit ? c.type : parent ? parent.type : catTab;
-    sh.el.innerHTML = `${sheetHead(isEdit ? 'Edit category' : parent ? `New in ${esc(parent.name)}` : 'New category')}
-      <label class="f">Name</label><input id="cName" value="${esc(c?.name || '')}" autocomplete="off">
-      ${isTop ? `<label class="f">Icon (an emoji)</label><input id="cIcon" value="${esc(c?.icon || '📁')}" maxlength="4">` : ''}
-      ${isTop && type === 'expense' ? `<label class="check"><input type="checkbox" id="cOdo" ${c?.odo ? 'checked' : ''}> Ask for odometer (for vehicle costs)</label>` : ''}
-      <button class="btn primary" data-act="save">Save</button>
-      ${isEdit ? '<button class="btn danger" data-act="del">Delete</button>' : ''}`;
+    const type = isEdit ? c.type : cat(parentId)?.type || catTab;
+    const banned = new Set(isEdit ? [c.id, ...descendants(c.id)] : []); // can't move inside itself
+    const f = { name: c?.name || '', parent: isEdit ? c.parent || '' : parentId || '', icon: c?.icon || '📁', odo: !!c?.odo };
+    const sync = () => {
+      f.name = val('cName').trim(); f.parent = val('cParent');
+      if ($('#cIcon', sh.el)) f.icon = val('cIcon').trim();
+      if ($('#cOdo', sh.el)) f.odo = checked('cOdo');
+    };
+    const draw = () => {
+      const isTop = !f.parent, parent = cat(f.parent);
+      const opts = catTree(type).filter(({ c: x }) => !banned.has(x.id));
+      sh.el.innerHTML = `${sheetHead(isEdit ? 'Edit category' : parent ? `New in ${esc(parent.name)}` : 'New category')}
+        <label class="f">Name</label><input id="cName" value="${esc(f.name)}" placeholder="${isTop ? 'e.g. Groceries' : 'e.g. Edeka, Dairy, Washing stuff'}" autocomplete="off">
+        <label class="f">Inside</label><select id="cParent"><option value="">— Main category (top level) —</option>
+          ${opts.map(({ c: x, depth }) => `<option value="${x.id}" ${x.id === f.parent ? 'selected' : ''}>${'   '.repeat(depth)}${depth ? '└ ' : x.icon + ' '}${esc(x.name)}</option>`).join('')}</select>
+        ${isTop ? `<label class="f">Icon (an emoji)</label><input id="cIcon" value="${esc(f.icon)}" maxlength="4">` : ''}
+        ${isTop && type === 'expense' ? `<label class="check"><input type="checkbox" id="cOdo" ${f.odo ? 'checked' : ''}> Ask for odometer (for vehicle costs)</label>` : ''}
+        ${isEdit && descendants(c.id).length ? `<div class="hint">Its ${descendants(c.id).length} subcategor${descendants(c.id).length > 1 ? 'ies move' : 'y moves'} with it.</div>` : ''}
+        <button class="btn primary" data-act="save">Save</button>
+        ${isEdit ? '<button class="btn danger" data-act="del">Delete</button>' : ''}`;
+    };
+    sh.el.addEventListener('change', e => { if (e.target.id === 'cParent') { sync(); draw(); } });
     sh.actions.save = () => {
-      const name = val('cName').trim();
-      if (!name) return toast('Please enter a name');
-      const data = { name };
-      if (isTop) { data.icon = val('cIcon').trim() || '📁'; data.odo = checked('cOdo'); }
-      if (isEdit) Object.assign(c, data);
-      else S.categories.push({ id: uid(), type, parent: parent?.id || null, icon: parent?.icon || data.icon, ...data });
+      sync();
+      if (!f.name) return toast('Please enter a name');
+      const parent = cat(f.parent) || null;
+      const data = { name: f.name, parent: parent?.id || null, icon: parent ? topCat(parent.id).icon : f.icon || '📁', odo: !parent && type === 'expense' && f.odo };
+      if (isEdit) {
+        if (!c.parent && parent) delete S.budgets[c.id]; // budgets are for main categories only
+        Object.assign(c, data);
+      } else S.categories.push({ id: uid(), type, ...data });
       afterSave();
     };
     sh.actions.del = () => {
-      const ids = [c.id, ...S.categories.filter(x => x.parent === c.id).map(x => x.id)];
-      const used = S.transactions.some(t => ids.includes(t.categoryId)) || S.recurring.some(r => ids.includes(r.categoryId));
-      if (used) return alert('This category is used by transactions or recurring items, so it can’t be deleted. You can rename it instead.');
-      if (!confirm(ids.length > 1 ? 'Delete this category and its subcategories?' : 'Delete this category?')) return;
+      const ids = [c.id, ...descendants(c.id)];
+      const n = S.transactions.filter(t => ids.includes(t.categoryId)).length + S.recurring.filter(r => ids.includes(r.categoryId)).length;
+      const parent = cat(c.parent);
+      if (n && !parent) return alert(`This category is used by ${n} entr${n > 1 ? 'ies' : 'y'}, so it can’t be deleted. You can rename it, or move it inside another category.`);
+      const what = ids.length > 1 ? 'this category and its subcategories' : 'this category';
+      if (!confirm(n ? `Delete ${what}?\nIts ${n} entr${n > 1 ? 'ies' : 'y'} will move to “${catName(parent.id)}”.` : `Delete ${what}?`)) return;
+      if (n) for (const x of [...S.transactions, ...S.recurring]) if (ids.includes(x.categoryId)) x.categoryId = parent.id;
       S.categories = S.categories.filter(x => !ids.includes(x.id));
       delete S.budgets[c.id];
+      afterSave('Deleted');
+    };
+    draw();
+  });
+}
+
+/* ---- Payment method form ---- */
+function openMethodForm(m) {
+  openSheet(sh => {
+    const isEdit = !!m;
+    sh.el.innerHTML = `${sheetHead(isEdit ? 'Edit payment method' : 'New payment method')}
+      <label class="f">Name</label><input id="mName" value="${esc(m?.name || '')}" placeholder="e.g. Mastercard, Visa, PayPal, Apple Pay" autocomplete="off">
+      <label class="f">Icon (an emoji)</label><input id="mIcon" value="${esc(m?.icon || '💳')}" maxlength="4">
+      <label class="f">Linked account</label><select id="mAcc"><option value="">— none (choose each time) —</option>${accountOptions(m?.accountId || '', m?.accountId)}</select>
+      <div class="hint">When you pick this method, the app selects this account for you. You can still change it per entry.</div>
+      ${isEdit ? `<label class="check"><input type="checkbox" id="mArch" ${m.archived ? 'checked' : ''}> Archived (hide when adding entries)</label>` : ''}
+      <button class="btn primary" data-act="save">Save</button>
+      ${isEdit ? '<button class="btn danger" data-act="del">Delete</button>' : ''}`;
+    if (!isEdit) $('#mAcc', sh.el).value = '';
+    sh.actions.save = () => {
+      const name = val('mName').trim();
+      if (!name) return toast('Please enter a name');
+      const data = { name, icon: val('mIcon').trim() || '💳', accountId: val('mAcc') || null };
+      if (isEdit) Object.assign(m, data, { archived: checked('mArch') }); else S.methods.push({ id: uid(), ...data });
+      afterSave();
+    };
+    sh.actions.del = () => {
+      const n = S.transactions.filter(t => t.methodId === m.id).length;
+      if (!confirm(n ? `This method is used by ${n} entr${n > 1 ? 'ies' : 'y'}. Delete it anyway?\n(The entries stay, just without a payment method. Tip: “Archived” hides it instead.)` : 'Delete this payment method?')) return;
+      for (const x of [...S.transactions, ...S.recurring]) if (x.methodId === m.id) delete x.methodId;
+      S.methods = S.methods.filter(x => x.id !== m.id);
       afterSave('Deleted');
     };
   });
@@ -950,7 +1134,7 @@ const ACTIONS = {
   payDue: el => {
     if (el.dataset.kind === 'loan') return openLoanPayment(loan(el.dataset.id));
     const r = rec(el.dataset.id); if (!r) return;
-    openTxForm(null, { type: r.type, _amt: centsToInput(r.amount), categoryId: r.categoryId, accountId: r.accountId, note: r.name, recurringId: r.id });
+    openTxForm(null, { type: r.type, _amt: centsToInput(r.amount), categoryId: r.categoryId, accountId: r.accountId, methodId: r.methodId || null, note: r.name, recurringId: r.id });
   },
   skipDue: el => { const r = rec(el.dataset.id); if (!r) return; r.nextDate = nextOcc(r); persist(); render(); toast(`Skipped · next ${fmtDate(r.nextDate)}`); },
   newLoan: () => openLoanForm(null),
@@ -962,6 +1146,8 @@ const ACTIONS = {
   editAcc: el => openAccountForm(acc(el.dataset.id)),
   newCat: el => openCategoryForm(null, el.dataset.parent || null),
   editCat: el => openCategoryForm(cat(el.dataset.id)),
+  newMethod: () => openMethodForm(null),
+  editMethod: el => openMethodForm(method(el.dataset.id)),
   catTab: el => { catTab = el.dataset.type; render(); },
   repMonth: el => go('reports', shiftMonth(viewArg || curYM(), Number(el.dataset.n))),
   toggleCat: el => { const k = el.dataset.id; expanded.has(k) ? expanded.delete(k) : expanded.add(k); render(); },
@@ -983,12 +1169,12 @@ const ACTIONS = {
     inp.click();
   },
   exportCSV: () => {
-    const rows = [['Date', 'Type', 'Amount', 'Account', 'To account', 'Category', 'Subcategory', 'Note', 'Interest', 'Odometer']];
+    const rows = [['Date', 'Type', 'Amount', 'Account', 'To account', 'Paid with', 'Category', 'Subcategory', 'Note', 'Interest', 'Odometer']];
     for (const t of sortedTx()) {
-      const c = cat(t.categoryId), top = topCat(t.categoryId);
+      const path = catPath(t.categoryId);
       rows.push([fmtDate(t.date), t.type === 'loan' ? loanTxTitle(t, loan(t.loanId)) : t.type,
         ((t.type === 'transfer' ? t.amount : txSigned(t)) / 100).toFixed(2).replace('.', ','), acc(t.accountId)?.name || '', acc(t.toAccountId)?.name || '',
-        top?.name || '', c?.parent ? c.name : '', t.note || '', t.interest ? (t.interest / 100).toFixed(2).replace('.', ',') : '', t.odometer || '']);
+        method(t.methodId)?.name || '', path[0]?.name || '', path.slice(1).map(c => c.name).join(' › '), t.note || '', t.interest ? (t.interest / 100).toFixed(2).replace('.', ',') : '', t.odometer || '']);
     }
     shareFile(`my-money-${today()}.csv`, '﻿' + rows.map(r => r.map(csvCell).join(';')).join('\r\n'), 'text/csv');
   },

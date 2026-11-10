@@ -142,3 +142,9 @@ input.amount { font-size: 34px; font-weight: 700; text-align: center; padding: 1
   background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 999px; font-size: 14px; opacity: 0; pointer-events: none;
   transition: .2s; z-index: 50; white-space: nowrap; }
 #toast.show { opacity: 1; transform: translateX(-50%); }
+
+/* Nested categories & payment methods */
+.chips.sub + .chips.sub { margin-top: 6px; margin-left: 12px; }
+.chip.add { color: var(--accent); font-weight: 600; background: none; border: 1px dashed var(--line); }
+.chip.add:only-child { width: auto; }
+.addsub { font-size: 20px; font-weight: 600; padding: 0 8px; }
