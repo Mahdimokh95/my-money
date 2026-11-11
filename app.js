@@ -210,7 +210,7 @@ function accountBalance(id) {
 }
 /* Cash-flow sign of a transaction (for daily totals) */
 const txSigned = t => t.type === 'income' ? t.amount : t.type === 'expense' ? -t.amount
-  : t.type === 'loan' ? (t.flow === 'in' ? t.amount : -t.amount) : 0;
+  : t.type === 'loan' ? (t.purchase ? -t.amount : t.flow === 'in' ? t.amount : -t.amount) : 0;
 
 /* Income & expenses of a month. Transfers and loan principal are NOT income/expense; loan interest is. */
 function monthStats(ym) {
@@ -220,6 +220,7 @@ function monthStats(ym) {
     if (!t.date.startsWith(ym)) continue;
     if (t.type === 'income') { income += t.amount; const k = topCat(t.categoryId)?.id || 'none'; byInc[k] = (byInc[k] || 0) + t.amount; }
     else if (t.type === 'expense') { expense += t.amount; const k = topCat(t.categoryId)?.id || 'none'; byCat[k] = (byCat[k] || 0) + t.amount; }
+    else if (t.type === 'loan' && t.purchase) { expense += t.amount; const k = topCat(t.categoryId)?.id || 'none'; byCat[k] = (byCat[k] || 0) + t.amount; }
     else if (t.type === 'loan' && t.interest) {
       if (t.flow === 'out') { expense += t.interest; byCat.interest = (byCat.interest || 0) + t.interest; }
       else { income += t.interest; byInc.interest = (byInc.interest || 0) + t.interest; }
@@ -234,7 +235,7 @@ const statLabel = (k, type) => k === 'interest' ? (type === 'expense' ? '🏦 Lo
 function catBreakdown(ym, type, rootId) {
   const total = {}, direct = {};
   for (const t of S.transactions) {
-    if (t.type !== type || !t.categoryId || !t.date.startsWith(ym)) continue;
+    if (!(t.type === type || (type === 'expense' && t.purchase)) || !t.categoryId || !t.date.startsWith(ym)) continue;
     const p = catPath(t.categoryId);
     if (p[0]?.id !== rootId) continue;
     direct[t.categoryId] = (direct[t.categoryId] || 0) + t.amount;
@@ -253,10 +254,15 @@ function catBreakdown(ym, type, rootId) {
 /* Loans */
 const loanFlow = l => l.direction === 'borrowed' ? 'out' : 'in'; // direction of repayments
 const loanTxs = l => S.transactions.filter(t => t.type === 'loan' && t.loanId === l.id);
-const loanPaid = l => loanTxs(l).filter(t => !t.initial && t.flow === loanFlow(l)).reduce((s, t) => s + t.amount - (t.interest || 0), 0);
+/* Repayments recorded in the app (without interest) */
+const loanPaidRecorded = l => loanTxs(l).filter(t => !t.initial && t.flow === loanFlow(l)).reduce((s, t) => s + t.amount - (t.interest || 0), 0);
+/* + what was already paid before tracking it here ("left to pay today") */
+const loanPaid = l => (l.prepaid || 0) + loanPaidRecorded(l);
+const loanPurchaseTx = l => loanTxs(l).find(t => t.purchase);
 const loanRemaining = l => Math.max(0, l.principal - loanPaid(l));
 function loanTxTitle(t, l) {
   if (!l) return 'Loan';
+  if (t.purchase) return `Bought with ${l.person} (pay later)`;
   if (t.initial) return l.direction === 'borrowed' ? `Loan from ${l.person}` : `Lent to ${l.person}`;
   return l.direction === 'borrowed' ? `Repayment to ${l.person}` : `Repayment from ${l.person}`;
 }
@@ -342,6 +348,10 @@ function txRow(t, showDate = false) {
     const cn = cat(t.categoryId) ? catName(t.categoryId) : '';
     icon = cn ? catIcon(t.categoryId) : '🔁'; title = t.note || cn || 'Transfer';
     sub = (t.note && cn ? cn + ' · ' : '') + `${a?.name || '?'} → ${acc(t.toAccountId)?.name || '?'}`;
+  } else if (t.type === 'loan' && t.purchase) {
+    const l = loan(t.loanId);
+    icon = catIcon(t.categoryId); title = t.note || catName(t.categoryId);
+    sub = (t.note ? catName(t.categoryId) + ' · ' : '') + `Pay later · ${l?.person || ''}`; sign = '−';
   } else if (t.type === 'loan') {
     const l = loan(t.loanId);
     icon = '🤝'; title = loanTxTitle(t, l); sub = (t.note ? t.note + ' · ' : '') + (a?.name || '');
@@ -385,7 +395,8 @@ const VIEWS = {
     }
 
     h += `<div class="card tap" data-act="go" data-v="accounts"><h2>Total balance</h2><div class="big ${total < 0 ? 'neg' : ''}">${fm(total)}</div>
-      <div class="pills">${accs.map(a => `<span class="pill">${ACC_ICON[a.type] || ''} ${esc(a.name)}: <b>${fm(accountBalance(a.id))}</b></span>`).join('')}</div></div>`;
+      <div class="pills">${accs.map(a => `<span class="pill">${ACC_ICON[a.type] || ''} ${esc(a.name)}: <b>${fm(accountBalance(a.id))}</b></span>`).join('')}</div>
+      ${owe || owed ? `<div class="t2 mt">After loans (− I owe + owed to me): <b class="${total - owe + owed < 0 ? 'neg' : ''}">${fm(total - owe + owed)}</b></div>` : ''}</div>`;
 
     h += `<div class="card tap" data-act="go" data-v="reports"><h2>${monthLabel(ym)} <span class="link">Report ›</span></h2>${statsHtml(st)}</div>`;
 
@@ -525,7 +536,7 @@ const VIEWS = {
       return `<div class="item" data-act="go" data-v="loan" data-id="${l.id}" style="display:block">
         <div class="row"><div class="ic">${l.direction === 'borrowed' ? '📥' : '📤'}</div><div class="grow">
         <div class="t1">${esc(l.person)} ${rem <= 0 ? '<span class="badge green">paid off</span>' : ''}</div>
-        <div class="t2">${l.direction === 'borrowed' ? 'I borrowed' : 'I lent'} ${fm(l.principal)} · ${fmtDate(l.startDate)}</div></div>
+        <div class="t2">${l.kind === 'purchase' ? `Pay later · ${esc(catName(loanPurchaseTx(l)?.categoryId))}` : l.direction === 'borrowed' ? 'I borrowed' : 'I lent'} ${fm(l.principal)} · ${fmtDate(l.startDate)}</div></div>
         <div class="amt ${l.direction === 'borrowed' ? 'neg' : 'pos'}">${fm(rem)}</div></div>
         <div class="bar"><i class="good" style="width:${pct}%"></i></div></div>`;
     };
@@ -544,8 +555,10 @@ const VIEWS = {
     const txs = loanTxs(l).sort((a, b) => b.date.localeCompare(a.date));
     const interest = txs.reduce((s, t) => s + (t.interest || 0), 0);
     const info = [
-      ['Type', l.direction === 'borrowed' ? 'I borrowed (I owe)' : 'I lent (owed to me)'],
-      ['Amount', fm(l.principal)], ['Start date', fmtDate(l.startDate)],
+      ['Type', l.kind === 'purchase' ? 'Bought now, pay later' : l.direction === 'borrowed' ? 'I borrowed (I owe)' : 'I lent (owed to me)'],
+      l.kind === 'purchase' && loanPurchaseTx(l) ? ['Bought', esc(catName(loanPurchaseTx(l).categoryId))] : null,
+      [l.inclInterest ? 'Total (incl. interest)' : 'Amount', fm(l.principal)], ['Start date', fmtDate(l.startDate)],
+      l.prepaid ? ['Paid before tracking here', fm(l.prepaid)] : null,
       l.monthlyPayment ? ['Monthly payment', fm(l.monthlyPayment)] : null,
       l.dueDay ? ['Due day', `${l.dueDay}. of each month`] : null,
       l.rate ? ['Interest rate', `${String(l.rate).replace('.', ',')} %`] : null,
@@ -672,10 +685,10 @@ const txSearchText = t => [t.note, t.type === 'loan' ? loanTxTitle(t, loan(t.loa
   acc(t.toAccountId)?.name, centsToInput(t.amount), fm(t.amount), fmtDate(t.date)].join(' ').toLowerCase();
 function histList() {
   const q = hist.q.trim().toLowerCase();
-  const list = sortedTx().filter(t => (hist.month === 'all' || t.date.startsWith(hist.month)) && (hist.type === 'all' || t.type === hist.type) && (!q || txSearchText(t).includes(q)));
+  const list = sortedTx().filter(t => (hist.month === 'all' || t.date.startsWith(hist.month)) && (hist.type === 'all' || t.type === hist.type || (hist.type === 'expense' && t.purchase)) && (!q || txSearchText(t).includes(q)));
   if (!list.length) return `<div class="empty">${S.transactions.length ? 'Nothing matches your filters.' : 'No transactions yet — tap ＋ to add one.'}</div>`;
   const inc = list.filter(t => t.type === 'income').reduce((s, t) => s + t.amount, 0);
-  const exp = list.filter(t => t.type === 'expense').reduce((s, t) => s + t.amount, 0);
+  const exp = list.filter(t => t.type === 'expense' || t.purchase).reduce((s, t) => s + t.amount, 0);
   let h = `<div class="card"><div class="stats"><div class="stat"><div class="l">${list.length} items</div><div class="v"></div></div>
     <div class="stat"><div class="l">Income</div><div class="v pos">${fm(inc)}</div></div><div class="stat"><div class="l">Spent</div><div class="v">${fm(exp)}</div></div></div></div>`;
   const groups = new Map();
@@ -776,7 +789,7 @@ function afterSave(msg = 'Saved') { persist(); closeSheet(); render(); toast(msg
 
 /* ---- Transaction form ---- */
 function openTxForm(t, pre = {}) {
-  if (t?.type === 'loan') return openLoanPayment(loan(t.loanId), t);
+  if (t?.type === 'loan') return t.purchase ? (loan(t.loanId) ? openLoanForm(loan(t.loanId)) : toast('This loan no longer exists')) : openLoanPayment(loan(t.loanId), t);
   openSheet(sh => {
     const isEdit = !!t;
     const f = t ? { ...t, _amt: centsToInput(t.amount) }
@@ -843,59 +856,86 @@ function openTxForm(t, pre = {}) {
 function openLoanForm(l) {
   openSheet(sh => {
     const isEdit = !!l;
-    const f = l ? { ...l, _amt: centsToInput(l.principal), _mp: l.monthlyPayment ? centsToInput(l.monthlyPayment) : '' }
-      : { direction: 'borrowed', person: '', _amt: '', startDate: today(), _mp: '', dueDay: '', rate: '', note: '', record: true, accountId: lastAccountId() };
+    const ptx = l && loanPurchaseTx(l);
+    const f = l ? { ...l, _amt: centsToInput(l.principal), _mp: l.monthlyPayment ? centsToInput(l.monthlyPayment) : '',
+        _left: centsToInput(loanRemaining(l)), categoryId: ptx?.categoryId || null, kind: l.kind || 'cash' }
+      : { direction: 'borrowed', kind: 'purchase', person: '', _amt: '', _left: '', startDate: today(), _mp: '', dueDay: '', rate: '', note: '',
+          record: true, accountId: lastAccountId(), inclInterest: true, categoryId: null };
     const sync = () => {
-      f.person = val('lPerson').trim(); f._amt = val('lAmt'); f.startDate = val('lStart') || today(); f._mp = val('lMp');
-      f.dueDay = val('lDue'); f.rate = val('lRate'); f.note = val('lNote').trim();
+      f.person = val('lPerson').trim(); f._amt = val('lAmt'); f._left = val('lLeft'); f.startDate = val('lStart') || today(); f._mp = val('lMp');
+      f.dueDay = val('lDue'); f.note = val('lNote').trim(); f.inclInterest = checked('lIncl');
+      if ($('#lRate', sh.el)) f.rate = val('lRate');
       if ($('#lRec', sh.el)) { f.record = checked('lRec'); f.accountId = val('lAcc'); }
       if ($('#lClosed', sh.el)) f.closed = checked('lClosed');
     };
     const draw = () => {
-      const b = f.direction === 'borrowed';
+      const b = f.direction === 'borrowed', buy = b && f.kind === 'purchase';
       sh.el.innerHTML = `${sheetHead(isEdit ? 'Edit loan' : 'New loan')}
-        <div class="seg"><button class="${b ? 'on exp' : ''}" data-act="setDir" data-d="borrowed">I borrowed</button>
+        ${isEdit ? '' : `<div class="seg"><button class="${b ? 'on exp' : ''}" data-act="setDir" data-d="borrowed">I borrowed</button>
           <button class="${!b ? 'on inc' : ''}" data-act="setDir" data-d="lent">I lent</button></div>
-        <label class="f">${b ? 'Lender (bank or person)' : 'Borrower (who owes you)'}</label>
-        <input id="lPerson" value="${esc(f.person)}" placeholder="${b ? 'e.g. Sparkasse, Ali' : 'e.g. Sara'}" autocomplete="off">
-        <label class="f">Loan amount</label><input id="lAmt" class="amount" inputmode="decimal" placeholder="0,00 €" value="${esc(f._amt)}">
-        <div class="hint">For bank loans, enter the amount still owed today if the loan started earlier.</div>
-        <div class="two"><div><label class="f">Start date</label><input id="lStart" type="date" value="${f.startDate}"></div>
-          <div><label class="f">Interest rate % (optional)</label><input id="lRate" inputmode="decimal" placeholder="e.g. 4,5" value="${esc(f.rate)}"></div></div>
+        ${b ? `<div class="seg" style="margin-top:8px"><button class="${buy ? 'on' : ''}" data-act="setKind" data-k="purchase">🛍️ Bought something</button>
+          <button class="${!buy ? 'on' : ''}" data-act="setKind" data-k="cash">💶 Got money</button></div>
+          <div class="hint">${buy ? 'Pay later / installments: Klarna, PayPal, store financing… The purchase counts as spending; your bank balance only goes down when you pay an installment.'
+            : 'Cash or money paid into your account: bank loan, a friend…'}</div>` : ''}`}
+        <label class="f">${buy ? 'Paid later to (Klarna, PayPal…)' : b ? 'Lender (bank or person)' : 'Borrower (who owes you)'}</label>
+        <input id="lPerson" value="${esc(f.person)}" placeholder="${buy ? 'e.g. Klarna, PayPal' : b ? 'e.g. Sparkasse, Ali' : 'e.g. Sara'}" autocomplete="off">
+        ${buy ? `<label class="f">What did you buy?</label>${catPicker('expense', f.categoryId, true)}` : ''}
+        <label class="f">${f.inclInterest ? 'Total to pay back (incl. interest & fees)' : 'Loan amount'}</label>
+        <input id="lAmt" class="amount" inputmode="decimal" placeholder="0,00 €" value="${esc(f._amt)}">
+        <label class="check"><input type="checkbox" id="lIncl" ${f.inclInterest ? 'checked' : ''}> <span>This amount already includes interest &amp; fees
+          <div class="hint" style="margin:2px 0 0">Then each payment reduces it fully — no need to split out interest.</div></span></label>
+        <label class="f">${b ? 'Left to pay today' : 'Still owed to me today'} (optional)</label>
+        <input id="lLeft" inputmode="decimal" placeholder="${isEdit ? '' : 'empty = full amount'}" value="${esc(f._left)}">
+        <div class="hint">${isEdit ? 'Change this anytime to correct what is left.' : 'Started earlier and already paid some? Enter what is left — the rest counts as paid before.'}</div>
+        <div class="two"><div><label class="f">Start / purchase date</label><input id="lStart" type="date" value="${f.startDate}"></div>
+          ${f.inclInterest ? '' : `<div><label class="f">Interest rate % (optional)</label><input id="lRate" inputmode="decimal" placeholder="e.g. 4,5" value="${esc(f.rate)}"></div>`}</div>
         <div class="two"><div><label class="f">Monthly payment (optional)</label><input id="lMp" inputmode="decimal" placeholder="0,00" value="${esc(f._mp)}"></div>
           <div><label class="f">Due day of month</label><input id="lDue" inputmode="numeric" placeholder="e.g. 1" value="${esc(f.dueDay)}"></div></div>
         <div class="hint">With a due day you'll get a reminder on the home screen each month.</div>
-        <label class="f">Note</label><input id="lNote" value="${esc(f.note)}" placeholder="optional">
+        <label class="f">Note</label><input id="lNote" value="${esc(f.note)}" placeholder="${buy ? 'e.g. Headphones from Amazon' : 'optional'}">
         ${isEdit ? `<label class="check"><input type="checkbox" id="lClosed" ${f.closed ? 'checked' : ''}> Loan is closed / settled</label>`
-          : `<label class="check"><input type="checkbox" id="lRec" ${f.record ? 'checked' : ''}> ${b ? 'I received this money into an account' : 'This money left one of my accounts'}</label>
+          : buy ? '' : `<label class="check"><input type="checkbox" id="lRec" ${f.record ? 'checked' : ''}> ${b ? 'I received this money into an account' : 'This money left one of my accounts'}</label>
              <select id="lAcc" style="margin-top:8px">${accountOptions(f.accountId)}</select>`}
         <button class="btn primary" data-act="save">Save</button>
         ${isEdit ? '<button class="btn danger" data-act="del">Delete loan</button>' : ''}`;
     };
-    sh.actions.setDir = el => { sync(); f.direction = el.dataset.d; draw(); };
+    sh.actions.setDir = el => { sync(); f.direction = el.dataset.d; if (f.direction === 'lent') f.kind = 'cash'; draw(); };
+    sh.actions.setKind = el => { sync(); f.kind = el.dataset.k; f.inclInterest = f.kind === 'purchase'; draw(); };
+    pickerActions(sh, f, sync, draw);
+    sh.el.addEventListener('change', e => { if (e.target.id === 'lIncl') { sync(); draw(); } });
     sh.actions.save = () => {
       sync();
-      const principal = parseAmount(f._amt);
+      const principal = parseAmount(f._amt), buy = f.direction === 'borrowed' && f.kind === 'purchase';
       if (!f.person) return toast('Please enter a name');
-      if (!(principal > 0)) return toast('Please enter the loan amount');
-      const mp = parseAmount(f._mp), due = parseInt(f.dueDay, 10);
-      const data = { direction: f.direction, person: f.person, principal, startDate: f.startDate,
-        monthlyPayment: mp > 0 ? mp : null, dueDay: due >= 1 && due <= 31 ? due : null,
-        rate: f.rate ? String(f.rate).replace(',', '.') : '', note: f.note };
-      if (isEdit) {
-        Object.assign(l, data, { closed: !!f.closed });
-        afterSave('Loan updated');
-      } else {
-        const nl = { id: uid(), closed: false, ...data };
-        S.loans.push(nl);
-        if (f.record && f.accountId) S.transactions.push({ id: uid(), created: Date.now(), type: 'loan', loanId: nl.id, initial: true,
-          flow: f.direction === 'borrowed' ? 'in' : 'out', amount: principal, accountId: f.accountId, date: f.startDate, note: '' });
-        persist(); closeSheet(); go('loan', nl.id); toast('Loan added');
+      if (buy && !f.categoryId) return toast('Please choose what you bought (category)');
+      if (!(principal > 0)) return toast('Please enter the amount');
+      const recorded = isEdit ? loanPaidRecorded(l) : 0;
+      let prepaid = isEdit ? l.prepaid || 0 : 0;
+      if (f._left.trim()) {
+        const left = parseAmount(f._left);
+        if (!(left >= 0) || left > principal) return toast('“Left to pay” must be between 0 and the total');
+        prepaid = Math.max(0, principal - left - recorded);
       }
+      const mp = parseAmount(f._mp), due = parseInt(f.dueDay, 10);
+      const data = { direction: f.direction, kind: buy ? 'purchase' : 'cash', person: f.person, principal, startDate: f.startDate, prepaid,
+        inclInterest: f.inclInterest, monthlyPayment: mp > 0 ? mp : null, dueDay: due >= 1 && due <= 31 ? due : null,
+        rate: !f.inclInterest && f.rate ? String(f.rate).replace(',', '.') : '', note: f.note };
+      const target = isEdit ? Object.assign(l, data, { closed: !!f.closed }) : { id: uid(), closed: false, ...data };
+      if (buy) { // the purchase itself = spending in a category, no account involved
+        const pt = loanPurchaseTx(target);
+        const pdata = { amount: principal, date: f.startDate, categoryId: f.categoryId, note: f.note };
+        if (pt) Object.assign(pt, pdata);
+        else S.transactions.push({ id: uid(), created: Date.now(), type: 'loan', loanId: target.id, initial: true, purchase: true, flow: 'in', accountId: null, ...pdata });
+      }
+      if (isEdit) return afterSave('Loan updated');
+      S.loans.push(target);
+      if (!buy && f.record && f.accountId) S.transactions.push({ id: uid(), created: Date.now(), type: 'loan', loanId: target.id, initial: true,
+        flow: f.direction === 'borrowed' ? 'in' : 'out', amount: principal, accountId: f.accountId, date: f.startDate, note: '' });
+      persist(); closeSheet(); go('loan', target.id); toast('Loan added');
     };
     sh.actions.del = () => {
       const n = loanTxs(l).length;
-      if (!confirm(`Delete this loan${n ? ` and its ${n} payment record${n > 1 ? 's' : ''}` : ''}?`)) return;
+      if (!confirm(`Delete this loan${n ? ` and its ${n} record${n > 1 ? 's' : ''}` : ''}?`)) return;
       S.transactions = S.transactions.filter(t => t.loanId !== l.id);
       S.loans = S.loans.filter(x => x.id !== l.id);
       persist(); closeSheet(); go('loans'); toast('Loan deleted');
@@ -915,7 +955,7 @@ function openLoanPayment(l, t) {
     sh.el.innerHTML = `${sheetHead(esc(title))}
       <input id="pAmt" class="amount" inputmode="decimal" placeholder="0,00 €" value="${esc(f._amt)}">
       <div class="hint" style="text-align:center">Remaining: ${fm(loanRemaining(l))}</div>
-      ${initial ? '' : `<label class="f">Of which interest / fees (optional)</label><input id="pInt" inputmode="decimal" placeholder="0,00" value="${esc(f._int)}">
+      ${initial || l.inclInterest ? '' : `<label class="f">Of which interest / fees (optional)</label><input id="pInt" inputmode="decimal" placeholder="0,00" value="${esc(f._int)}">
         <div class="hint">Only the part without interest reduces the remaining amount. Interest counts as an expense in reports.</div>`}
       <label class="f">${(initial ? !b : b) ? 'Paid from account' : 'Received into account'}</label><select id="pAcc">${accountOptions(f.accountId)}</select>
       <label class="f">Date</label><input id="pDate" type="date" value="${f.date}">
@@ -924,7 +964,7 @@ function openLoanPayment(l, t) {
       ${isEdit ? '<button class="btn danger" data-act="del">Delete</button>' : ''}`;
     sh.actions.save = () => {
       const amount = parseAmount(val('pAmt'));
-      const interest = initial ? 0 : (parseAmount(val('pInt')) || 0);
+      const interest = initial || l.inclInterest ? 0 : (parseAmount(val('pInt')) || 0);
       if (!(amount > 0)) return toast('Please enter an amount');
       if (interest < 0 || interest > amount) return toast('Interest must be between 0 and the amount');
       const data = { amount, interest: interest || 0, accountId: val('pAcc'), date: val('pDate') || today(), note: val('pNote').trim() };

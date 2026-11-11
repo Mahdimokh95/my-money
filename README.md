@@ -29,6 +29,7 @@ It works offline, doesn't expire, and doesn't need to be refreshed.
 - **More → Accounts:** set the starting balance of Cash and Girokonto, and add your other cards or accounts.
 - **More → Bills & recurring:** add rent, phone, insurance, subscriptions, and salary.
 - **More → Loans:** add bank loans and money you lent to or borrowed from friends.
+  For Klarna / PayPal pay-later purchases choose **🛍️ Bought something**: enter the total incl. interest and, if it started earlier, what is left today.
 - **More → Budgets:** set monthly limits (optional).
 - **More → Settings → Categories:** add your own categories and subcategories at any depth
   (e.g. Groceries › Edeka › Dairy). There are tabs for Expenses, Income and Transfers.
