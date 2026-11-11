@@ -148,3 +148,4 @@ input.amount { font-size: 34px; font-weight: 700; text-align: center; padding: 1
 .chip.add { color: var(--accent); font-weight: 600; background: none; border: 1px dashed var(--line); }
 .chip.add:only-child { width: auto; }
 .addsub { font-size: 20px; font-weight: 600; padding: 0 8px; }
+.amt.muted { color: var(--muted); font-weight: 500; }

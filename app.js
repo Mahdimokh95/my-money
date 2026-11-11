@@ -210,7 +210,13 @@ function accountBalance(id) {
 }
 /* Cash-flow sign of a transaction (for daily totals) */
 const txSigned = t => t.type === 'income' ? t.amount : t.type === 'expense' ? -t.amount
-  : t.type === 'loan' ? (t.purchase ? -t.amount : t.flow === 'in' ? t.amount : -t.amount) : 0;
+  : t.type === 'loan' ? (t.purchase ? 0 : t.flow === 'in' ? t.amount : -t.amount) : 0;
+/* Installment paid on a "bought now, pay later" loan → returns that purchase's category id, else null */
+function installmentCat(t) {
+  if (t.type !== 'loan' || t.initial || t.flow !== 'out') return null;
+  const l = loan(t.loanId);
+  return l?.kind === 'purchase' ? loanPurchaseTx(l)?.categoryId || 'none' : null;
+}
 
 /* Income & expenses of a month. Transfers and loan principal are NOT income/expense; loan interest is. */
 function monthStats(ym) {
@@ -220,7 +226,8 @@ function monthStats(ym) {
     if (!t.date.startsWith(ym)) continue;
     if (t.type === 'income') { income += t.amount; const k = topCat(t.categoryId)?.id || 'none'; byInc[k] = (byInc[k] || 0) + t.amount; }
     else if (t.type === 'expense') { expense += t.amount; const k = topCat(t.categoryId)?.id || 'none'; byCat[k] = (byCat[k] || 0) + t.amount; }
-    else if (t.type === 'loan' && t.purchase) { expense += t.amount; const k = topCat(t.categoryId)?.id || 'none'; byCat[k] = (byCat[k] || 0) + t.amount; }
+    else if (t.type === 'loan' && t.purchase) { /* info only: counted when the installments are paid */ }
+    else if (installmentCat(t)) { const k = topCat(installmentCat(t))?.id || 'none'; expense += t.amount; byCat[k] = (byCat[k] || 0) + t.amount; }
     else if (t.type === 'loan' && t.interest) {
       if (t.flow === 'out') { expense += t.interest; byCat.interest = (byCat.interest || 0) + t.interest; }
       else { income += t.interest; byInc.interest = (byInc.interest || 0) + t.interest; }
@@ -235,10 +242,11 @@ const statLabel = (k, type) => k === 'interest' ? (type === 'expense' ? '🏦 Lo
 function catBreakdown(ym, type, rootId) {
   const total = {}, direct = {};
   for (const t of S.transactions) {
-    if (!(t.type === type || (type === 'expense' && t.purchase)) || !t.categoryId || !t.date.startsWith(ym)) continue;
-    const p = catPath(t.categoryId);
+    const cid = t.type === type ? t.categoryId : type === 'expense' ? installmentCat(t) : null;
+    if (!cid || !t.date.startsWith(ym)) continue;
+    const p = catPath(cid);
     if (p[0]?.id !== rootId) continue;
-    direct[t.categoryId] = (direct[t.categoryId] || 0) + t.amount;
+    direct[cid] = (direct[cid] || 0) + t.amount;
     p.forEach(c => { total[c.id] = (total[c.id] || 0) + t.amount; });
   }
   const rows = (id, depth) => {
@@ -351,10 +359,12 @@ function txRow(t, showDate = false) {
   } else if (t.type === 'loan' && t.purchase) {
     const l = loan(t.loanId);
     icon = catIcon(t.categoryId); title = t.note || catName(t.categoryId);
-    sub = (t.note ? catName(t.categoryId) + ' · ' : '') + `Pay later · ${l?.person || ''}`; sign = '−';
+    sub = (t.note ? catName(t.categoryId) + ' · ' : '') + `Pay later · ${l?.person || ''} · counted when paid`; cls = 'muted';
   } else if (t.type === 'loan') {
     const l = loan(t.loanId);
-    icon = '🤝'; title = loanTxTitle(t, l); sub = (t.note ? t.note + ' · ' : '') + (a?.name || '');
+    const ic = installmentCat(t);
+    icon = ic && cat(ic) ? catIcon(ic) : '🤝'; title = loanTxTitle(t, l);
+    sub = (t.note ? t.note + ' · ' : '') + (ic && cat(ic) ? catName(ic) + ' · ' : '') + (a?.name || '');
     if (t.interest) sub += ` · interest ${fm(t.interest)}`;
     cls = t.flow === 'in' ? 'pos' : ''; sign = t.flow === 'in' ? '+' : '−';
   } else {
@@ -475,6 +485,12 @@ const VIEWS = {
       return `<div class="tap" data-act="toggleCat" data-id="${k}" style="margin:8px 0"><div class="row between"><span>${esc(statLabel(k, type))}
         <span class="t2">${children(k).length ? (expanded.has(k) ? '▾' : '▸') : ''}</span></span><b class="${cls}">${fm(v)}</b></div>${sub ? `<div class="subrows">${sub}</div>` : ''}</div>`;
     }).join('');
+    const bought = S.transactions.filter(t => t.purchase && t.date.startsWith(ym));
+    if (bought.length) h += `<div class="card"><h2>Bought on installments</h2>${bought.map(t => {
+        const l = loan(t.loanId);
+        return `<div class="row between tap" style="margin:8px 0" data-act="go" data-v="loan" data-id="${t.loanId}"><span>${catIcon(t.categoryId)} ${esc(t.note || catName(t.categoryId))}
+          <span class="t2">· ${esc(l?.person || '')}</span></span><b class="t2">${fm(t.amount)}</b></div>`;
+      }).join('')}<div class="hint">For your information only — not counted in this month. Each installment counts as spending in the month you pay it.</div></div>`;
     h += `<div class="card"><h2>Income by source</h2>${inc.length ? smallRows(inc, 'income', 'pos') : '<div class="t2">No income this month.</div>'}</div>`;
 
     // Spending by payment method (only once methods are being used)
@@ -685,10 +701,10 @@ const txSearchText = t => [t.note, t.type === 'loan' ? loanTxTitle(t, loan(t.loa
   acc(t.toAccountId)?.name, centsToInput(t.amount), fm(t.amount), fmtDate(t.date)].join(' ').toLowerCase();
 function histList() {
   const q = hist.q.trim().toLowerCase();
-  const list = sortedTx().filter(t => (hist.month === 'all' || t.date.startsWith(hist.month)) && (hist.type === 'all' || t.type === hist.type || (hist.type === 'expense' && t.purchase)) && (!q || txSearchText(t).includes(q)));
+  const list = sortedTx().filter(t => (hist.month === 'all' || t.date.startsWith(hist.month)) && (hist.type === 'all' || t.type === hist.type || (hist.type === 'expense' && (t.purchase || installmentCat(t)))) && (!q || txSearchText(t).includes(q)));
   if (!list.length) return `<div class="empty">${S.transactions.length ? 'Nothing matches your filters.' : 'No transactions yet — tap ＋ to add one.'}</div>`;
   const inc = list.filter(t => t.type === 'income').reduce((s, t) => s + t.amount, 0);
-  const exp = list.filter(t => t.type === 'expense' || t.purchase).reduce((s, t) => s + t.amount, 0);
+  const exp = list.filter(t => t.type === 'expense' || installmentCat(t)).reduce((s, t) => s + t.amount, 0);
   let h = `<div class="card"><div class="stats"><div class="stat"><div class="l">${list.length} items</div><div class="v"></div></div>
     <div class="stat"><div class="l">Income</div><div class="v pos">${fm(inc)}</div></div><div class="stat"><div class="l">Spent</div><div class="v">${fm(exp)}</div></div></div></div>`;
   const groups = new Map();
@@ -875,7 +891,7 @@ function openLoanForm(l) {
           <button class="${!b ? 'on inc' : ''}" data-act="setDir" data-d="lent">I lent</button></div>
         ${b ? `<div class="seg" style="margin-top:8px"><button class="${buy ? 'on' : ''}" data-act="setKind" data-k="purchase">🛍️ Bought something</button>
           <button class="${!buy ? 'on' : ''}" data-act="setKind" data-k="cash">💶 Got money</button></div>
-          <div class="hint">${buy ? 'Pay later / installments: Klarna, PayPal, store financing… The purchase counts as spending; your bank balance only goes down when you pay an installment.'
+          <div class="hint">${buy ? 'Pay later / installments: Klarna, PayPal, store financing… In the purchase month it is only shown for info. Each installment you pay counts as spending (in this category) and comes off your balance.'
             : 'Cash or money paid into your account: bank loan, a friend…'}</div>` : ''}`}
         <label class="f">${buy ? 'Paid later to (Klarna, PayPal…)' : b ? 'Lender (bank or person)' : 'Borrower (who owes you)'}</label>
         <input id="lPerson" value="${esc(f.person)}" placeholder="${buy ? 'e.g. Klarna, PayPal' : b ? 'e.g. Sparkasse, Ali' : 'e.g. Sara'}" autocomplete="off">
@@ -957,6 +973,7 @@ function openLoanPayment(l, t) {
       <div class="hint" style="text-align:center">Remaining: ${fm(loanRemaining(l))}</div>
       ${initial || l.inclInterest ? '' : `<label class="f">Of which interest / fees (optional)</label><input id="pInt" inputmode="decimal" placeholder="0,00" value="${esc(f._int)}">
         <div class="hint">Only the part without interest reduces the remaining amount. Interest counts as an expense in reports.</div>`}
+      ${!initial && l.kind === 'purchase' ? `<div class="hint" style="text-align:center">Counts as spending in ${esc(catName(loanPurchaseTx(l)?.categoryId))} this month.</div>` : ''}
       <label class="f">${(initial ? !b : b) ? 'Paid from account' : 'Received into account'}</label><select id="pAcc">${accountOptions(f.accountId)}</select>
       <label class="f">Date</label><input id="pDate" type="date" value="${f.date}">
       <label class="f">Note</label><input id="pNote" value="${esc(f.note || '')}" placeholder="optional">
@@ -1212,8 +1229,8 @@ const ACTIONS = {
     const rows = [['Date', 'Type', 'Amount', 'Account', 'To account', 'Paid with', 'Category', 'Subcategory', 'Note', 'Interest', 'Odometer']];
     for (const t of sortedTx()) {
       const path = catPath(t.categoryId);
-      rows.push([fmtDate(t.date), t.type === 'loan' ? loanTxTitle(t, loan(t.loanId)) : t.type,
-        ((t.type === 'transfer' ? t.amount : txSigned(t)) / 100).toFixed(2).replace('.', ','), acc(t.accountId)?.name || '', acc(t.toAccountId)?.name || '',
+      rows.push([fmtDate(t.date), t.type === 'loan' ? loanTxTitle(t, loan(t.loanId)) + (t.purchase ? ' – info, not counted' : '') : t.type,
+        ((t.type === 'transfer' || t.purchase ? t.amount : txSigned(t)) / 100).toFixed(2).replace('.', ','), acc(t.accountId)?.name || '', acc(t.toAccountId)?.name || '',
         method(t.methodId)?.name || '', path[0]?.name || '', path.slice(1).map(c => c.name).join(' › '), t.note || '', t.interest ? (t.interest / 100).toFixed(2).replace('.', ',') : '', t.odometer || '']);
     }
     shareFile(`my-money-${today()}.csv`, '﻿' + rows.map(r => r.map(csvCell).join(';')).join('\r\n'), 'text/csv');
